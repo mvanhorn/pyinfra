@@ -446,6 +446,7 @@ def _main(
     logger.info("--> Connecting to hosts...")
     state.set_stage(StateStage.Connect)
     connect_all(state)
+    _prompt_for_sudo_passwords(state, config)
 
     state.set_stage(StateStage.Prepare)
     can_diff, state, config = _handle_commands(
@@ -757,6 +758,16 @@ def _set_fail_prompts(state: State, config: Config) -> None:
         return not _do_confirm("One of more hosts failed, continue?")
 
     state.should_raise_failed_hosts = should_raise_failed_hosts
+
+
+def _prompt_for_sudo_passwords(state: State, config: Config) -> None:
+    if not config.USE_SUDO_PASSWORD or config.SUDO_PASSWORD is not None:
+        return
+
+    for host in state.active_hosts:
+        host.connector_data["prompted_sudo_password"] = getpass(
+            f"{host.print_prefix}sudo password: "
+        )
 
 
 def _get_inventory_pattern_matches(

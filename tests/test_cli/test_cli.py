@@ -1,9 +1,18 @@
 import json
 from os import path
+from tempfile import NamedTemporaryFile
 from unittest import TestCase
+from unittest.mock import patch
 
-from pyinfra.api import Host, Inventory
-from pyinfra_cli.cli import _apply_inventory_exclude, _apply_inventory_limit, _main
+from pyinfra import state as global_state
+from pyinfra.api import Config, Host, Inventory, State, StringCommand
+from pyinfra.connectors.util import CommandOutput, OutputLine, make_unix_command_for_host
+from pyinfra_cli.cli import (
+    _apply_inventory_exclude,
+    _apply_inventory_limit,
+    _main,
+    _prompt_for_sudo_passwords,
+)
 
 from ..paramiko_util import PatchSSHTestCase
 from .util import run_cli
@@ -151,6 +160,126 @@ class TestExecCli(PatchSSHTestCase):
             "echo hi",
         )
         assert result.exit_code == 0, result.stderr
+
+
+class TestSudoPasswordPrompt(PatchSSHTestCase):
+    inventory = path.join("tests", "test_cli", "deploy", "inventories", "inventory.py")
+
+    def test_use_sudo_password_is_a_copyable_config_default(self):
+        assert Config().USE_SUDO_PASSWORD is False
+        assert Config(USE_SUDO_PASSWORD=True).copy().USE_SUDO_PASSWORD is True
+
+    def test_use_sudo_password_prompts_before_first_sudo_command(self):
+        config = Config(USE_SUDO_PASSWORD=True)
+        inventory = Inventory((["somehost"], {}))
+        state = State(inventory, config)
+        host = inventory.get_host("somehost")
+        state.activate_host(host)
+
+        with patch("pyinfra_cli.cli.getpass", return_value="host-password") as getpass:
+            _prompt_for_sudo_passwords(state, config)
+
+        getpass.assert_called_once_with(f"{host.print_prefix}sudo password: ")
+        assert host.connector_data["prompted_sudo_password"] == "host-password"
+
+        def run_shell_command(_command):
+            return (
+                True,
+                CommandOutput([OutputLine("stdout", "/tmp/pyinfra-sudo-askpass")]),
+            )
+
+        host.run_shell_command = run_shell_command  # type: ignore[method-assign]
+        command = make_unix_command_for_host(
+            state,
+            host,
+            StringCommand("true"),
+            _sudo=True,
+        )
+        assert "PYINFRA_SUDO_PASSWORD=host-password" in command.get_raw_value()
+        assert "sudo -H -A -k" in command.get_raw_value()
+        assert "sudo -H -n" not in command.get_raw_value()
+
+    def test_config_use_sudo_password_prompts_for_each_active_host(self):
+        with NamedTemporaryFile(mode="w", suffix=".py") as config_file:
+            config_file.write("from pyinfra import config\nconfig.USE_SUDO_PASSWORD = True\n")
+            config_file.flush()
+
+            def get_password(prompt):
+                return f"password for {prompt}"
+
+            with patch("pyinfra_cli.cli.getpass", side_effect=get_password) as getpass:
+                result = run_cli(
+                    "-y",
+                    "--dry",
+                    "--config",
+                    config_file.name,
+                    self.inventory,
+                    "exec",
+                    "--",
+                    "echo hi",
+                )
+
+        assert result.exit_code == 0, result.stderr
+        assert getpass.call_count == 2
+        for host in global_state.active_hosts:
+            prompt = f"{host.print_prefix}sudo password: "
+            assert host.connector_data["prompted_sudo_password"] == f"password for {prompt}"
+
+    def test_cli_use_sudo_password_prompts_for_each_active_host(self):
+        def get_password(prompt):
+            return f"password for {prompt}"
+
+        with patch("pyinfra_cli.cli.getpass", side_effect=get_password) as getpass:
+            result = run_cli(
+                "-y",
+                "--dry",
+                "--sudo",
+                "--use-sudo-password",
+                self.inventory,
+                "exec",
+                "--",
+                "echo hi",
+            )
+
+        assert result.exit_code == 0, result.stderr
+        assert getpass.call_count == 2
+        for host in global_state.active_hosts:
+            prompt = f"{host.print_prefix}sudo password: "
+            assert host.connector_data["prompted_sudo_password"] == f"password for {prompt}"
+
+    def test_same_sudo_password_skips_host_specific_prompts(self):
+        with patch("pyinfra_cli.cli.getpass", return_value="shared-password") as getpass:
+            result = run_cli(
+                "-y",
+                "--dry",
+                "--use-sudo-password",
+                "--same-sudo-password",
+                self.inventory,
+                "exec",
+                "--",
+                "echo hi",
+            )
+
+        assert result.exit_code == 0, result.stderr
+        getpass.assert_called_once_with("sudo password: ")
+        assert global_state.config.SUDO_PASSWORD == "shared-password"
+        assert all(
+            "prompted_sudo_password" not in host.connector_data
+            for host in global_state.active_hosts
+        )
+
+    def test_disabled_eager_prompt_leaves_fallback_unprimed(self):
+        config = Config()
+        inventory = Inventory((["somehost"], {}))
+        state = State(inventory, config)
+        host = inventory.get_host("somehost")
+        state.activate_host(host)
+
+        with patch("pyinfra_cli.cli.getpass") as getpass:
+            _prompt_for_sudo_passwords(state, config)
+
+        getpass.assert_not_called()
+        assert "prompted_sudo_password" not in host.connector_data
 
 
 class TestJsonOutput(PatchSSHTestCase):

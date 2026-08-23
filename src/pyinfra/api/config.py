@@ -47,6 +47,7 @@ class ConfigDefaults:
     PRESERVE_SUDO_ENV: bool = False
     USE_SUDO_LOGIN: bool = False
     SUDO_PASSWORD: str | None = None
+    USE_SUDO_PASSWORD: bool = False
     # Use doas and optional user
     DOAS: bool = False
     DOAS_USER: str | None = None
